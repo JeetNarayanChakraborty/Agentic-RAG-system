@@ -1,11 +1,9 @@
 import os
+import re
 import json
 import time
-import instructor
 import pandas as pd
 from ragas import RunConfig
-from openai import AsyncOpenAI
-from ragas.llms import llm_factory
 from dotenv import load_dotenv
 from langchain_groq import ChatGroq
 from langchain_google_genai import ChatGoogleGenerativeAI
@@ -19,11 +17,6 @@ from langchain_text_splitters import (
 )
 import dspy
 from dspy.teleprompt import BootstrapFewShot, MIPROv2
-from ragas.testset import TestsetGenerator
-from ragas.testset.synthesizers import (
-    SingleHopSpecificQuerySynthesizer,
-    MultiHopAbstractQuerySynthesizer,
-)
 from ragas.llms import LangchainLLMWrapper
 from ragas.embeddings import LangchainEmbeddingsWrapper
 from ragas import evaluate, EvaluationDataset, SingleTurnSample
@@ -32,24 +25,28 @@ from ragas.metrics import Faithfulness, AnswerRelevancy
 load_dotenv()
 
 
-groq_client = AsyncOpenAI(
-    api_key=os.getenv("GROQ_API_KEY"), base_url="https://api.groq.com/openai/v1"
-)
-
 generator_llm = ChatGroq(
     model="openai/gpt-oss-120b",
     temperature=0.0,
-    max_tokens=4096,
+    max_tokens=1024,
     api_key=os.getenv("GROQ_API_KEY"),
 )
 
-judge_llm = llm_factory(
-    model="openai/gpt-oss-20b",
-    provider="openai",
-    client=groq_client,
-    max_tokens=4096,
-    mode=instructor.Mode.JSON_SCHEMA,
+grader_llm = ChatGroq(
+    model="llama-3.3-70b-versatile",
+    temperature=0.0,
+    max_tokens=256,  # Separate 12,000 TPM bucket for ReAct grading/rewriting
+    api_key=os.getenv("GROQ_API_KEY"),
 )
+
+judge_llm_raw = ChatGoogleGenerativeAI(
+    model="gemini-3.8-flash",
+    temperature=0.0,
+    google_api_key=os.getenv("GEMINI_API_KEY"),
+    max_output_tokens=8192,
+)
+
+judge_llm = LangchainLLMWrapper(judge_llm_raw)
 
 # Gemini for embeddings
 gemini_embeddings = GoogleGenerativeAIEmbeddings(
@@ -69,12 +66,27 @@ EVAL_PARENT_META = "parent_lookup_eval.json"
 def build_eval_vector_store():
     print("Building new vector store for the Golden Dataset...")
     md_text = pymupdf4llm.to_markdown("data/eval_document.pdf")
-    markdown_splitter = MarkdownHeaderTextSplitter(
-        headers_to_split_on=[("#", "Header 1"), ("##", "Header 2"), ("###", "Header 3")]
-    )
-    parent_chunks = markdown_splitter.split_text(md_text)
 
-    child_splitter = RecursiveCharacterTextSplitter(chunk_size=250, chunk_overlap=50)
+    # Strip repeating page headers and footers
+    md_text = re.sub(r"Real-World Architectures Vol\. 2\s*", "", md_text)
+    md_text = re.sub(r"Free edition not for sale CC BY-NC-ND 4\.0\s*\d*", "", md_text)
+
+    markdown_splitter = MarkdownHeaderTextSplitter(
+        headers_to_split_on=[
+            ("#", "Header 1"),
+            ("##", "Header 2"),
+            ("###", "Header 3"),
+            ("####", "Header 4"),
+        ],
+        strip_headers=False,
+    )
+    raw_parents = markdown_splitter.split_text(md_text)
+
+    # Bound parent chunks to ~800 tokens so k=4 never exceeds 3,200 tokens
+    parent_limiter = RecursiveCharacterTextSplitter(chunk_size=3200, chunk_overlap=300)
+    parent_chunks = parent_limiter.split_documents(raw_parents)
+
+    child_splitter = RecursiveCharacterTextSplitter(chunk_size=350, chunk_overlap=50)
     final_children = []
     parent_lookup = {}
 
@@ -89,11 +101,8 @@ def build_eval_vector_store():
     with open(EVAL_PARENT_META, "w") as f:
         json.dump(parent_lookup, f)
 
-    import time
-
     vector_store = None
     batch_size = 80
-
     print(f"Embedding {len(final_children)} chunks in batches of {batch_size}...")
 
     for i in range(0, len(final_children), batch_size):
@@ -103,8 +112,8 @@ def build_eval_vector_store():
         else:
             vector_store.add_documents(batch)
 
-        print(f"Embedded batch {i//batch_size + 1}... waiting 60s for rate limit.")
-        time.sleep(60)
+        if i + batch_size < len(final_children):
+            time.sleep(60)
 
     vector_store.save_local(EVAL_INDEX_PATH)
     return vector_store, parent_lookup, parent_chunks
@@ -120,7 +129,7 @@ if os.path.exists(EVAL_INDEX_PATH):
 else:
     vector_store, parent_lookup, _ = build_eval_vector_store()
 
-retriever = vector_store.as_retriever(search_kwargs={"k": 1})
+retriever = vector_store.as_retriever(search_kwargs={"k": 4})
 
 
 def retrieve_with_parents(query):
@@ -130,7 +139,7 @@ def retrieve_with_parents(query):
     for doc in child_docs:
         parent_id = doc.metadata.get("parent_id")
         if parent_id and parent_id not in seen:
-            parent_content = parent_lookup.get(parent_id, doc.page_content)
+            parent_content = parent_lookup.get(parent_id, doc.page_content)[:3500]
             parent_docs.append(parent_content)
             seen.add(parent_id)
     return parent_docs
@@ -191,14 +200,17 @@ rag_evaluation_dataset = [
 ]
 
 questions = [item["question"] for item in rag_evaluation_dataset]
-references = [item["answer"] for item in rag_evaluation_dataset]
+references = [
+    re.sub(r"\[cite:\s*[\d,\s]+\]", "", item["answer"]).strip()
+    for item in rag_evaluation_dataset
+]
 
 
 # EVALUATION HELPER
 
 
 def run_ragas_eval(answers, contexts, label):
-    print(f"Evaluating {label} (using 8B judge + 2 metrics)...")
+    print(f"Evaluating {label} (using Gemini judge + 2 metrics)...")
 
     # Create all samples first
     all_samples = [
@@ -217,7 +229,7 @@ def run_ragas_eval(answers, contexts, label):
 
     # Force RAGAS to run one call at a time
     config = RunConfig(max_workers=1, max_wait=60, timeout=180)
-    all_scores = []
+    batch_dfs = []
 
     # Process in batches of 2 questions
     batch_size = 2
@@ -232,25 +244,25 @@ def run_ragas_eval(answers, contexts, label):
 
         result = evaluate(dataset=dataset, metrics=metrics, run_config=config)
         df = result.to_pandas()
+        batch_dfs.append(df)
 
-        # Extract scores from this batch
-        batch_scores = {
-            col: round(float(df[col].mean()), 4)
-            for col in df.columns
-            if col not in ["user_input", "response", "retrieved_contexts", "reference"]
-        }
-        all_scores.append(batch_scores)
-
-        # If this isn't the last batch, wait 20 seconds for the TPM window to reset
+        # If this isn't the last batch, wait 20 seconds for the rate limit window to reset
         if i + batch_size < len(all_samples):
-            print("  -> Sleeping 20s to avoid TPM rate limit...")
+            print("  -> Sleeping 20s to avoid rate limit...")
             time.sleep(20)
 
-    # Average the scores across all batches
+    full_df = pd.concat(batch_dfs, ignore_index=True)
+    metric_cols = [
+        col
+        for col in full_df.columns
+        if col not in ["user_input", "response", "retrieved_contexts", "reference"]
+    ]
+
     final_scores = {}
-    for metric in all_scores[0].keys():
-        final_scores[metric] = round(
-            sum(batch[metric] for batch in all_scores) / len(all_scores), 4
+    for col in metric_cols:
+        valid_scores = full_df[col].dropna()
+        final_scores[col] = (
+            round(float(valid_scores.mean()), 4) if not valid_scores.empty else 0.0
         )
 
     print(f"--- {label} Scores ---")
@@ -265,43 +277,43 @@ print("\nRunning Single-Shot Baseline...")
 ss_answers, ss_contexts = [], []
 for q in questions:
     ctx_list = retrieve_with_parents(q)
-    ctx = "\n\n".join(ctx_list)
+    ctx = "\n\n".join(ctx_list)[:16000]
     ans = generator_llm.invoke(
         f"Answer using ONLY this context:\n{ctx}\n\nQuestion: {q}"
     ).content
     ss_answers.append(ans)
     ss_contexts.append(ctx_list)
-    time.sleep(60)
+    time.sleep(45)
 baseline_single = run_ragas_eval(ss_answers, ss_contexts, "Single-Shot")
 
 print("\nRunning Agentic ReAct Baseline (Simplified)...")
 react_answers, react_contexts = [], []
 for q in questions:
     ctx_list = retrieve_with_parents(q)
-    ctx = "\n\n".join(ctx_list)
+    ctx = "\n\n".join(ctx_list)[:16000]
 
-    # Grade Call
-    grade = generator_llm.invoke(
+    # Grade Call (Uses grader_llm)
+    grade = grader_llm.invoke(
         f"Can you answer '{q}' using ONLY this context? Reply YES or NO.\nContext:\n{ctx}"
     ).content
-    time.sleep(60)
 
     if "NO" in grade.upper():
-        # Rewrite Call
-        refined_q = generator_llm.invoke(
-            f"Original question: {q}. Generate ONE new search query to find missing info."
+        # Rewrite Call (Uses grader_llm)
+        refined_q = grader_llm.invoke(
+            f"Original question: {q}. Generate ONE concise search query to find missing info."
         ).content
-        time.sleep(60)
 
         new_ctx_list = retrieve_with_parents(refined_q)
-        ctx_list.extend(new_ctx_list)
-        ctx = "\n\n".join(ctx_list)
+        for new_doc in new_ctx_list:
+            if new_doc not in ctx_list:
+                ctx_list.append(new_doc)
+        ctx = "\n\n".join(ctx_list)[:16000]
 
-    # Generate Call
+    # Generate Call (Uses generator_llm)
     ans = generator_llm.invoke(
         f"Answer using ONLY this context:\n{ctx}\n\nQuestion: {q}"
     ).content
-    time.sleep(60)
+    time.sleep(45)
 
     react_answers.append(ans)
     react_contexts.append(ctx_list)
@@ -336,13 +348,20 @@ class RAGPipeline(dspy.Module):
 
 
 def rag_metric(example, pred, trace=None):
-    return example.ground_truth.lower() in pred.answer.lower()
+    # Pace DSPy internal evaluation calls under Qwen's 8,000 TPM / 1,000 OTPM limit
+    time.sleep(35)
+    gt_tokens = set(re.findall(r"\w+", example.ground_truth.lower()))
+    pred_tokens = set(re.findall(r"\w+", pred.answer.lower()))
+    if not gt_tokens:
+        return 0.0
+    recall = len(gt_tokens & pred_tokens) / len(gt_tokens)
+    return recall >= 0.35 if trace is not None else recall
 
 
 trainset = []
 
 for q, ref in zip(questions, references):
-    ctx = "\n\n".join(retrieve_with_parents(q))
+    ctx = "\n\n".join(retrieve_with_parents(q))[:14000]
     trainset.append(
         dspy.Example(question=q, context=ctx, ground_truth=ref).with_inputs(
             "question", "context"
@@ -354,7 +373,7 @@ for q, ref in zip(questions, references):
 print("\nRunning BootstrapFewShot...")
 student = RAGPipeline()
 optimizer_bfs = BootstrapFewShot(
-    metric=rag_metric, max_bootstrapped_demos=0, max_labeled_demos=0
+    metric=rag_metric, max_bootstrapped_demos=0, max_labeled_demos=1
 )
 optimized_bfs = optimizer_bfs.compile(student, trainset=trainset)
 optimized_bfs.save("optimized_bfs.json")
@@ -365,29 +384,46 @@ optimized_bfs.save("optimized_bfs.json")
 bfs_answers, bfs_contexts = [], []
 for q in questions:
     ctx_list = retrieve_with_parents(q)
-    ctx = "\n\n".join(ctx_list)
+    ctx = "\n\n".join(ctx_list)[:14000]
     ans = optimized_bfs(question=q, context=ctx).answer
     bfs_answers.append(ans)
     bfs_contexts.append(ctx_list)
+    time.sleep(45)
 bfs_scores = run_ragas_eval(bfs_answers, bfs_contexts, "BootstrapFewShot")
 
 
-# MIPROv2 Optimization (2 trials)
+# MIPROv2 Optimization (Zero-Shot Instruction Optimization)
 
-print("\nRunning MIPROv2 (num_trials=2)...")
-optimizer_mipro = MIPROv2(metric=rag_metric, num_trials=1)
-optimized_mipro = optimizer_mipro.compile(RAGPipeline(), trainset=trainset)
+print("\nRunning MIPROv2 (Zero-Shot, num_trials=1)...")
+optimizer_mipro = MIPROv2(
+    metric=rag_metric,
+    auto=None,
+    num_candidates=2,
+    max_bootstrapped_demos=0,
+    max_labeled_demos=0,
+    num_threads=1,
+)
+optimized_mipro = optimizer_mipro.compile(
+    RAGPipeline(),
+    trainset=trainset,
+    num_trials=1,
+    minibatch=False,
+    max_bootstrapped_demos=0,
+    max_labeled_demos=0,
+)
 optimized_mipro.save("optimized_mipro.json")
 
 
 # MIPROv2 Eval
+
 mipro_answers, mipro_contexts = [], []
 for q in questions:
     ctx_list = retrieve_with_parents(q)
-    ctx = "\n\n".join(ctx_list)
+    ctx = "\n\n".join(ctx_list)[:14000]
     ans = optimized_mipro(question=q, context=ctx).answer
     mipro_answers.append(ans)
     mipro_contexts.append(ctx_list)
+    time.sleep(45)
 mipro_scores = run_ragas_eval(mipro_answers, mipro_contexts, "MIPROv2")
 
 

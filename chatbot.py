@@ -91,9 +91,17 @@ os.environ["GEMINI_API_KEY"] = gemini_api_key
 embedding = GoogleGenerativeAIEmbeddings(model="gemini-embedding-001")
 semantic_cache = SemanticCache(embedding=embedding, similarity_threshold=0.90)
 
-llm = ChatGroq(
+grader_llm = ChatGroq(
     model="llama-3.3-70b-versatile",
     temperature=0.0,
+    max_tokens=256,
+    api_key=os.getenv("GROQ_API_KEY"),
+)
+
+generator_llm = ChatGroq(
+    model="openai/gpt-oss-120b",
+    temperature=0.0,
+    max_tokens=1024,
     api_key=os.getenv("GROQ_API_KEY"),
 )
 
@@ -102,7 +110,7 @@ llm = ChatGroq(
 def retrieve_node(state: AgentState):
     query = state.get("refined_query") or state["question"]
 
-    # 1. Search the tiny Child chunks (k=4 for better coverage)
+    # 1. Search the tiny Child chunks (k=4 for multi-hop coverage)
     new_docs = sl.session_state.vector_store.as_retriever(
         search_kwargs={"k": 4}
     ).invoke(query)
@@ -113,21 +121,19 @@ def retrieve_node(state: AgentState):
         with open("parent_lookup.json", "r") as f:
             parent_lookup = json.load(f)
 
-    # 3. Swap Children for Parents
+    # 3. Swap Children for Bounded Parents (capped at 3500 chars)
     parent_docs = []
     seen_parents = set()
 
     for doc in new_docs:
         parent_id = doc.metadata.get("parent_id")
         if parent_id and parent_id not in seen_parents:
-            # Grab the big parent text
-            parent_content = parent_lookup.get(parent_id, doc.page_content)
-            # Create a new document with the parent content
+            parent_content = parent_lookup.get(parent_id, doc.page_content)[:3500]
             parent_doc = Document(page_content=parent_content, metadata=doc.metadata)
             parent_docs.append(parent_doc)
             seen_parents.add(parent_id)
         elif not parent_id:
-            parent_docs.append(doc)  # Fallback if no parent_id
+            parent_docs.append(doc)
 
     # 4. Accumulate: keep old docs, add only unique new ones
     existing = state.get("documents", [])
@@ -141,20 +147,21 @@ def retrieve_node(state: AgentState):
 
     # If nothing new was added, mark exhausted for Signal 2
     new_refined = state.get("refined_query") if added > 0 else "__EXHAUSTED__"
+    total_context_tokens = sum(len(d.page_content) for d in existing) // 4
 
     return {
         "documents": existing,
         "refined_query": new_refined,
         "previous_queries": state["previous_queries"] + [query],
-        "tokens_used": state["tokens_used"] + (len(query) + 1500) // 4,
+        "tokens_used": total_context_tokens,
     }
 
 
-# Node B: Grade (structured coverage scoring)
+# Node B: Grade (structured coverage scoring via isolated grader_llm)
 def grade_node(state: AgentState):
     question = state["question"]
     docs = state["documents"]
-    context = "\n\n".join(d.page_content for d in docs)
+    context = "\n\n".join(d.page_content for d in docs)[:16000]
 
     grader_system = (
         "You are a strict coverage grader. Given a user question and retrieved context, "
@@ -171,7 +178,7 @@ def grade_node(state: AgentState):
     ]
 
     try:
-        raw = llm.invoke(messages).content.strip()
+        raw = grader_llm.invoke(messages).content.strip()
         if raw.startswith("```"):
             raw = raw.split("```")[1]
             if raw.startswith("json"):
@@ -180,7 +187,6 @@ def grade_node(state: AgentState):
         coverage = float(parsed.get("coverage", 0.0))
         refined = parsed.get("refined_query")
     except Exception:
-        # If parsing fails, exit to generate with what we have
         coverage = 1.0
         refined = None
 
@@ -192,13 +198,13 @@ def grade_node(state: AgentState):
     }
 
 
-# Node C: Generate
+# Node C: Generate (via isolated generator_llm)
 def generate_node(state: AgentState):
     question = state["question"]
     docs = state["documents"]
     context = "\n\n".join(
         f"[Source {i+1}]\n{d.page_content}" for i, d in enumerate(docs)
-    )
+    )[:16000]
     coverage = state["coverage_history"][-1] if state["coverage_history"] else 1.0
 
     system_prompt = (
@@ -225,7 +231,7 @@ def generate_node(state: AgentState):
         ("system", system_prompt),
         ("human", question),
     ]
-    answer = llm.invoke(messages).content
+    answer = generator_llm.invoke(messages).content
     return {"answer": answer}
 
 
@@ -242,19 +248,19 @@ def should_continue(state: AgentState):
     if state.get("refined_query") == "__EXHAUSTED__":
         return "generate"
 
-    # Signal 3a: coverage stagnation — < 2% improvement
+    # Signal 3a: coverage stagnation
     if len(coverage) >= 2 and latest <= coverage[-2] + 0.02:
         return "generate"
 
-    # Signal 3b: query stagnation — refined query duplicates an earlier one
+    # Signal 3b: query stagnation
     if (
         state.get("refined_query")
         and state["refined_query"] in state["previous_queries"][:-1]
     ):
         return "generate"
 
-    # Signal 4: token budget backstop (~80k tokens)
-    if state["tokens_used"] >= 80_000:
+    # Signal 4: token budget backstop
+    if state["tokens_used"] >= 6_000:
         return "generate"
 
     return "retrieve"
@@ -303,7 +309,7 @@ if sl.session_state.vector_store is None and os.path.exists(FAISS_INDEX_PATH):
 
 
 # Upload pdf files
-sl.header("first chatbot")
+sl.header("Agentic RAG System")
 
 with sl.sidebar:
     sl.title("Your documents")
@@ -312,29 +318,35 @@ with sl.sidebar:
 # Read each page and extract text
 if file is not None and sl.session_state.processed_file != file.name:
 
-    #  Save the uploaded file temporarily so pymupdf can read it
+    # Save the uploaded file temporarily so pymupdf can read it
     temp_path = f"temp_{file.name}"
     with open(temp_path, "wb") as f:
         f.write(file.getbuffer())
 
     with sl.spinner("Parsing PDF structure..."):
-        #  Convert PDF to Markdown (Structure-Aware)
+        # Convert PDF to Markdown (Structure-Aware)
         md_text = pymupdf4llm.to_markdown(temp_path)
         os.remove(temp_path)  # Clean up temp file
 
-    #  Split by Headers to create PARENTS
+    # Split by Headers to create initial sections
     headers_to_split_on = [
         ("#", "Header 1"),
         ("##", "Header 2"),
         ("###", "Header 3"),
+        ("####", "Header 4"),
     ]
     markdown_splitter = MarkdownHeaderTextSplitter(
-        headers_to_split_on=headers_to_split_on
+        headers_to_split_on=headers_to_split_on,
+        strip_headers=False,
     )
-    parent_chunks = markdown_splitter.split_text(md_text)
+    raw_parents = markdown_splitter.split_text(md_text)
 
-    #  Create CHILDREN and the Parent Lookup
-    child_splitter = RecursiveCharacterTextSplitter(chunk_size=250, chunk_overlap=50)
+    # Bound parent chunks to ~800 tokens (3,200 chars) so k=4 stays under 3,200 tokens
+    parent_limiter = RecursiveCharacterTextSplitter(chunk_size=3200, chunk_overlap=300)
+    parent_chunks = parent_limiter.split_documents(raw_parents)
+
+    # Create CHILDREN and the Parent Lookup
+    child_splitter = RecursiveCharacterTextSplitter(chunk_size=350, chunk_overlap=50)
 
     final_children = []
     parent_lookup = {}
@@ -342,13 +354,13 @@ if file is not None and sl.session_state.processed_file != file.name:
     for i, parent in enumerate(parent_chunks):
         parent_id = f"parent_{i}"
 
-        # Save the big text for later
+        # Save the bounded parent text for later
         parent_lookup[parent_id] = parent.page_content
 
-        # Chop this parent into tiny children
+        # Chop this parent into child chunks
         children = child_splitter.split_documents([parent])
         for child in children:
-            # Attach the sticky note pointing to the parent
+            # Attach the parent pointer in metadata
             child.metadata["parent_id"] = parent_id
             final_children.append(child)
 
@@ -356,7 +368,7 @@ if file is not None and sl.session_state.processed_file != file.name:
     with open("parent_lookup.json", "w") as f:
         json.dump(parent_lookup, f)
 
-    #  Store chunks and their corresponding embedding in vector store (batched)
+    # Store chunks and their corresponding embedding in vector store (batched)
     if final_children:
         import time
 
@@ -371,7 +383,9 @@ if file is not None and sl.session_state.processed_file != file.name:
             else:
                 vector_store.add_documents(batch)
 
-            time.sleep(60)
+            # Only sleep if more batches remain
+            if i + batch_size < len(final_children):
+                time.sleep(60)
 
         sl.session_state.vector_store = vector_store
         sl.session_state.processed_file = file.name
