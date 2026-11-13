@@ -82,7 +82,6 @@ def build_eval_vector_store():
     )
     raw_parents = markdown_splitter.split_text(md_text)
 
-    # Bound parent chunks to ~800 tokens so k=4 never exceeds 3,200 tokens
     parent_limiter = RecursiveCharacterTextSplitter(chunk_size=3200, chunk_overlap=300)
     parent_chunks = parent_limiter.split_documents(raw_parents)
 
@@ -212,9 +211,13 @@ references = [
 def run_ragas_eval(answers, contexts, label):
     print(f"Evaluating {label} (using Gemini judge + 2 metrics)...")
 
-    # Create all samples first
     all_samples = [
-        SingleTurnSample(user_input=q, response=a, retrieved_contexts=c, reference=r)
+        SingleTurnSample(
+            user_input=q,
+            response=a,
+            retrieved_contexts=[doc[:3000] for doc in c],
+            reference=r,
+        )
         for q, a, c, r in zip(questions, answers, contexts, references)
     ]
 
@@ -227,8 +230,7 @@ def run_ragas_eval(answers, contexts, label):
         ),
     ]
 
-    # Force RAGAS to run one call at a time
-    config = RunConfig(max_workers=1, max_wait=60, timeout=180)
+    config = RunConfig(max_workers=1, max_wait=120, timeout=300)
     batch_dfs = []
 
     # Process in batches of 2 questions
@@ -246,7 +248,6 @@ def run_ragas_eval(answers, contexts, label):
         df = result.to_pandas()
         batch_dfs.append(df)
 
-        # If this isn't the last batch, wait 20 seconds for the rate limit window to reset
         if i + batch_size < len(all_samples):
             print("  -> Sleeping 20s to avoid rate limit...")
             time.sleep(20)
@@ -373,7 +374,7 @@ for q, ref in zip(questions, references):
 print("\nRunning BootstrapFewShot...")
 student = RAGPipeline()
 optimizer_bfs = BootstrapFewShot(
-    metric=rag_metric, max_bootstrapped_demos=0, max_labeled_demos=1
+    metric=rag_metric, max_bootstrapped_demos=0, max_labeled_demos=0
 )
 optimized_bfs = optimizer_bfs.compile(student, trainset=trainset)
 optimized_bfs.save("optimized_bfs.json")
@@ -388,11 +389,11 @@ for q in questions:
     ans = optimized_bfs(question=q, context=ctx).answer
     bfs_answers.append(ans)
     bfs_contexts.append(ctx_list)
-    time.sleep(45)
+    time.sleep(60)
 bfs_scores = run_ragas_eval(bfs_answers, bfs_contexts, "BootstrapFewShot")
 
 
-# MIPROv2 Optimization (Zero-Shot Instruction Optimization)
+# MIPROv2 Optimization
 
 print("\nRunning MIPROv2 (Zero-Shot, num_trials=1)...")
 optimizer_mipro = MIPROv2(
@@ -408,6 +409,7 @@ optimized_mipro = optimizer_mipro.compile(
     trainset=trainset,
     num_trials=1,
     minibatch=False,
+    view_data_batch_size=1,  # Prevents MIPROv2 from stacking 10 full contexts at once
     max_bootstrapped_demos=0,
     max_labeled_demos=0,
 )
@@ -423,7 +425,7 @@ for q in questions:
     ans = optimized_mipro(question=q, context=ctx).answer
     mipro_answers.append(ans)
     mipro_contexts.append(ctx_list)
-    time.sleep(45)
+    time.sleep(60)
 mipro_scores = run_ragas_eval(mipro_answers, mipro_contexts, "MIPROv2")
 
 
