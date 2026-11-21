@@ -268,23 +268,57 @@ def run_ragas_eval(answers, contexts, label):
 
 # RUN BASELINES
 
-print("\nLoading completed Single-Shot, ReAct, and BootstrapFewShot scores...")
-baseline_single = {
-    "faithfulness": 0.8599,
-    "answer_relevancy": 0.8347,
-}
+print("\nRunning Single-Shot Baseline...")
 
-baseline_react = {
-    "faithfulness": 0.8636,
-    "answer_relevancy": 0.8335,
-}
+ss_answers, ss_contexts = [], []
+for q in questions:
+    ctx_list = retrieve_with_parents(q)
+    ctx = "\n\n".join(ctx_list)[:16000]
+    ans = generator_llm.invoke(
+        f"Answer using ONLY this context:\n{ctx}\n\nQuestion: {q}"
+    ).content
+    ss_answers.append(ans)
+    ss_contexts.append(ctx_list)
+    time.sleep(45)
+baseline_single = run_ragas_eval(ss_answers, ss_contexts, "Single-Shot")
 
-bfs_scores = {
-    "faithfulness": 0.9548,
-    "answer_relevancy": 0.8376,
-}
+print("\nRunning Agentic ReAct Baseline")
+react_answers, react_contexts = [], []
+for q in questions:
+    ctx_list = retrieve_with_parents(q)
+    ctx = "\n\n".join(ctx_list)[:16000]
 
-print("\nConfiguring DSPy (qwen/qwen3.8-27b)...")
+    # Grade Call (Uses grader_llm)
+    grade = grader_llm.invoke(
+        f"Can you answer '{q}' using ONLY this context? Reply YES or NO.\nContext:\n{ctx}"
+    ).content
+
+    if "NO" in grade.upper():
+        # Rewrite Call (Uses grader_llm)
+        refined_q = grader_llm.invoke(
+            f"Original question: {q}. Generate ONE concise search query to find missing info."
+        ).content
+
+        new_ctx_list = retrieve_with_parents(refined_q)
+        for new_doc in new_ctx_list:
+            if new_doc not in ctx_list:
+                ctx_list.append(new_doc)
+        ctx = "\n\n".join(ctx_list)[:16000]
+
+    # Generate Call (Uses generator_llm)
+    ans = generator_llm.invoke(
+        f"Answer using ONLY this context:\n{ctx}\n\nQuestion: {q}"
+    ).content
+    time.sleep(45)
+
+    react_answers.append(ans)
+    react_contexts.append(ctx_list)
+
+baseline_react = run_ragas_eval(react_answers, react_contexts, "ReAct")
+
+
+print("\nConfiguring DSPy (Local Phi-4)...")
+
 
 dspy_lm = dspy.LM(
     "groq/qwen/qwen3.8-27b", max_tokens=800, api_key=os.getenv("GROQ_API_KEY")
@@ -329,6 +363,29 @@ for q, ref in zip(questions, references):
             "question", "context"
         )
     )
+
+# BFS Optimization
+
+print("\nRunning BootstrapFewShot...")
+student = RAGPipeline()
+optimizer_bfs = BootstrapFewShot(
+    metric=rag_metric, max_bootstrapped_demos=0, max_labeled_demos=0
+)
+optimized_bfs = optimizer_bfs.compile(student, trainset=trainset)
+optimized_bfs.save("optimized_bfs.json")
+
+
+# BFS Eval
+
+bfs_answers, bfs_contexts = [], []
+for q in questions:
+    ctx_list = retrieve_with_parents(q)
+    ctx = "\n\n".join(ctx_list)[:14000]
+    ans = optimized_bfs(question=q, context=ctx).answer
+    bfs_answers.append(ans)
+    bfs_contexts.append(ctx_list)
+    time.sleep(60)
+bfs_scores = run_ragas_eval(bfs_answers, bfs_contexts, "BootstrapFewShot")
 
 
 # MIPROv2 Optimization

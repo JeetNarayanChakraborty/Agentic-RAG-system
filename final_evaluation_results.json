@@ -1,0 +1,18 @@
+{
+  "Single-Shot": {
+    "faithfulness": 0.8599,
+    "answer_relevancy": 0.8347
+  },
+  "ReAct": {
+    "faithfulness": 0.8636,
+    "answer_relevancy": 0.8335
+  },
+  "BootstrapFewShot": {
+    "faithfulness": 0.9548,
+    "answer_relevancy": 0.8376
+  },
+  "MIPROv2": {
+    "faithfulness": 0.9317,
+    "answer_relevancy": 0.8412
+  }
+}
