@@ -266,8 +266,6 @@ def run_ragas_eval(answers, contexts, label):
 
 # RUN BASELINES
 
-# RUN BASELINES
-
 print("\nRunning Single-Shot Baseline...")
 
 ss_answers, ss_contexts = [], []
