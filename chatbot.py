@@ -92,7 +92,7 @@ embedding = GoogleGenerativeAIEmbeddings(model="gemini-embedding-001")
 semantic_cache = SemanticCache(embedding=embedding, similarity_threshold=0.90)
 
 grader_llm = ChatGroq(
-    model="llama-3.3-70b-versatile",
+    model="qwen/qwen3.8-27b",
     temperature=0.0,
     max_tokens=256,
     api_key=os.getenv("GROQ_API_KEY"),
@@ -198,7 +198,20 @@ def grade_node(state: AgentState):
     }
 
 
-# Node C: Generate (via isolated generator_llm)
+def load_dspy_instruction(filepath="optimized_mipro.json"):
+    if os.path.exists(filepath):
+        try:
+            with open(filepath, "r") as f:
+                data = json.load(f)
+            for key, val in data.items():
+                if isinstance(val, dict) and "signature" in val:
+                    return val["signature"].get("instructions", "")
+        except Exception:
+            pass
+    return "Answer the question using only the provided context."
+
+
+# Node C: Generate (via isolated generator_llm + DSPy MIPROv2 rules)
 def generate_node(state: AgentState):
     question = state["question"]
     docs = state["documents"]
@@ -206,18 +219,17 @@ def generate_node(state: AgentState):
         f"[Source {i+1}]\n{d.page_content}" for i, d in enumerate(docs)
     )[:16000]
     coverage = state["coverage_history"][-1] if state["coverage_history"] else 1.0
+    dspy_instruction = load_dspy_instruction()
 
     system_prompt = (
-        "You answer questions using ONLY the provided context.\n\n"
-        "Rules:\n"
-        "1. Answer directly and concisely. No preamble, no filler.\n"
-        "2. You MUST cite sources inline using [Source N] next to each claim. "
-        "For example: 'Jeet works at Deloitte [Source 1].'\n"
-        "3. If the context covers only part of a multi-part question, "
-        "answer the parts you can and explicitly state what the document does not cover.\n"
-        "4. If the context does not contain the answer, reply exactly: "
-        '"I don\'t know based on the provided document."\n'
-        "5. Never use outside knowledge. Never invent facts, numbers, or source tags.\n"
+        f"{dspy_instruction}\n\n"
+        "Operational Guidelines (DSPy Optimized):\n"
+        "1. Answer directly and concisely using ONLY the provided context. No preamble or filler.\n"
+        "2. Noise Filtration: Ignore administrative boilerplate or unrelated sections; focus strictly on explicit specifications, numbers, and definitions.\n"
+        "3. Multi-Source Verification: Cross-reference Markdown tables, code listings, and prose for consistency without inferring unstated values.\n"
+        "4. Mandatory Citations: Cite sources inline using [Source N] next to every claim (e.g., 'The system uses MongoDB 8.0 [Source 1].').\n"
+        "5. Partial or Missing Coverage: If the context covers only part of a multi-part question, answer the supported parts and explicitly state what is missing. "
+        'If the context does not contain the answer at all, reply exactly: "I don\'t know based on the provided document."\n'
     )
     if coverage < 0.8:
         system_prompt += (
@@ -324,8 +336,12 @@ if file is not None and sl.session_state.processed_file != file.name:
         f.write(file.getbuffer())
 
     with sl.spinner("Parsing PDF structure..."):
-        # Convert PDF to Markdown (Structure-Aware)
+        # Convert PDF to Markdown (Structure-Aware) and strip repeating headers/footers
         md_text = pymupdf4llm.to_markdown(temp_path)
+        md_text = re.sub(r"Real-World Architectures Vol\. 2\s*", "", md_text)
+        md_text = re.sub(
+            r"Free edition not for sale CC BY-NC-ND 4\.0\s*\d*", "", md_text
+        )
         os.remove(temp_path)  # Clean up temp file
 
     # Split by Headers to create initial sections

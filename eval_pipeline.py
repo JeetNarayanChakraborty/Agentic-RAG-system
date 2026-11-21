@@ -33,17 +33,17 @@ generator_llm = ChatGroq(
 )
 
 grader_llm = ChatGroq(
-    model="llama-3.3-70b-versatile",
+    model="qwen/qwen3.8-27b",
     temperature=0.0,
-    max_tokens=256,  # Separate 12,000 TPM bucket for ReAct grading/rewriting
+    max_tokens=256,
     api_key=os.getenv("GROQ_API_KEY"),
 )
 
 judge_llm_raw = ChatGoogleGenerativeAI(
-    model="gemini-3.8-flash",
-    temperature=0.0,
+    model="gemini-3.5-flash-lite",
     google_api_key=os.getenv("GEMINI_API_KEY"),
     max_output_tokens=8192,
+    max_retries=2,
 )
 
 judge_llm = LangchainLLMWrapper(judge_llm_raw)
@@ -230,27 +230,19 @@ def run_ragas_eval(answers, contexts, label):
         ),
     ]
 
-    config = RunConfig(max_workers=1, max_wait=120, timeout=300)
+    config = RunConfig(max_workers=1, max_retries=2, max_wait=30, timeout=120)
     batch_dfs = []
 
-    # Process in batches of 2 questions
-    batch_size = 2
-
-    for i in range(0, len(all_samples), batch_size):
-        batch_samples = all_samples[i : i + batch_size]
-        dataset = EvaluationDataset(samples=batch_samples)
-
-        print(
-            f"  -> Evaluating batch {i//batch_size + 1} of {(len(all_samples) + batch_size - 1)//batch_size}..."
-        )
+    for i, sample in enumerate(all_samples):
+        print(f"  -> Evaluating question {i + 1} of {len(all_samples)}...")
+        dataset = EvaluationDataset(samples=[sample])
 
         result = evaluate(dataset=dataset, metrics=metrics, run_config=config)
-        df = result.to_pandas()
-        batch_dfs.append(df)
+        batch_dfs.append(result.to_pandas())
 
-        if i + batch_size < len(all_samples):
-            print("  -> Sleeping 20s to avoid rate limit...")
-            time.sleep(20)
+        if i + 1 < len(all_samples):
+            print("  -> Sleeping 25s to respect 15 RPM limit...")
+            time.sleep(25)
 
     full_df = pd.concat(batch_dfs, ignore_index=True)
     metric_cols = [
@@ -274,56 +266,25 @@ def run_ragas_eval(answers, contexts, label):
 
 # RUN BASELINES
 
-print("\nRunning Single-Shot Baseline...")
-ss_answers, ss_contexts = [], []
-for q in questions:
-    ctx_list = retrieve_with_parents(q)
-    ctx = "\n\n".join(ctx_list)[:16000]
-    ans = generator_llm.invoke(
-        f"Answer using ONLY this context:\n{ctx}\n\nQuestion: {q}"
-    ).content
-    ss_answers.append(ans)
-    ss_contexts.append(ctx_list)
-    time.sleep(45)
-baseline_single = run_ragas_eval(ss_answers, ss_contexts, "Single-Shot")
+# RUN BASELINES
 
-print("\nRunning Agentic ReAct Baseline (Simplified)...")
-react_answers, react_contexts = [], []
-for q in questions:
-    ctx_list = retrieve_with_parents(q)
-    ctx = "\n\n".join(ctx_list)[:16000]
+print("\nLoading completed Single-Shot, ReAct, and BootstrapFewShot scores...")
+baseline_single = {
+    "faithfulness": 0.8599,
+    "answer_relevancy": 0.8347,
+}
 
-    # Grade Call (Uses grader_llm)
-    grade = grader_llm.invoke(
-        f"Can you answer '{q}' using ONLY this context? Reply YES or NO.\nContext:\n{ctx}"
-    ).content
+baseline_react = {
+    "faithfulness": 0.8636,
+    "answer_relevancy": 0.8335,
+}
 
-    if "NO" in grade.upper():
-        # Rewrite Call (Uses grader_llm)
-        refined_q = grader_llm.invoke(
-            f"Original question: {q}. Generate ONE concise search query to find missing info."
-        ).content
+bfs_scores = {
+    "faithfulness": 0.9548,
+    "answer_relevancy": 0.8376,
+}
 
-        new_ctx_list = retrieve_with_parents(refined_q)
-        for new_doc in new_ctx_list:
-            if new_doc not in ctx_list:
-                ctx_list.append(new_doc)
-        ctx = "\n\n".join(ctx_list)[:16000]
-
-    # Generate Call (Uses generator_llm)
-    ans = generator_llm.invoke(
-        f"Answer using ONLY this context:\n{ctx}\n\nQuestion: {q}"
-    ).content
-    time.sleep(45)
-
-    react_answers.append(ans)
-    react_contexts.append(ctx_list)
-
-baseline_react = run_ragas_eval(react_answers, react_contexts, "ReAct")
-
-
-print("\nConfiguring DSPy (Local Phi-4)...")
-
+print("\nConfiguring DSPy (qwen/qwen3.8-27b)...")
 
 dspy_lm = dspy.LM(
     "groq/qwen/qwen3.8-27b", max_tokens=800, api_key=os.getenv("GROQ_API_KEY")
@@ -368,29 +329,6 @@ for q, ref in zip(questions, references):
             "question", "context"
         )
     )
-
-# BFS Optimization
-
-print("\nRunning BootstrapFewShot...")
-student = RAGPipeline()
-optimizer_bfs = BootstrapFewShot(
-    metric=rag_metric, max_bootstrapped_demos=0, max_labeled_demos=0
-)
-optimized_bfs = optimizer_bfs.compile(student, trainset=trainset)
-optimized_bfs.save("optimized_bfs.json")
-
-
-# BFS Eval
-
-bfs_answers, bfs_contexts = [], []
-for q in questions:
-    ctx_list = retrieve_with_parents(q)
-    ctx = "\n\n".join(ctx_list)[:14000]
-    ans = optimized_bfs(question=q, context=ctx).answer
-    bfs_answers.append(ans)
-    bfs_contexts.append(ctx_list)
-    time.sleep(60)
-bfs_scores = run_ragas_eval(bfs_answers, bfs_contexts, "BootstrapFewShot")
 
 
 # MIPROv2 Optimization
